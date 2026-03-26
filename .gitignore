@@ -1,0 +1,15 @@
+# Detection data — don't upload these
+detections.db
+snapshots/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (if you have one)
+venv/
+.env
+
+# YOLO model weights (too large for GitHub)
+models/*.pt
