@@ -1,6 +1,7 @@
 # Detection data — don't upload these
 detections.db
 snapshots/
+credentials.py
 
 # Python cache
 __pycache__/

@@ -1,7 +1,7 @@
 """
 Fire & Smoke Detection — Tkinter Desktop GUI
 Run:  python gui.py
-Deps: pip install opencv-python pillow numpy
+Deps: pip install opencv-python pillow numpy pygame twilio
 Optional deep-learning layer: pip install ultralytics
 """
 
@@ -13,9 +13,122 @@ import queue
 import time
 import sqlite3
 import os
+import smtplib
 import numpy as np
-from datetime import datetime
-from PIL import Image, ImageTk
+from email.mime.text        import MIMEText
+from email.mime.multipart   import MIMEMultipart
+from email.mime.image       import MIMEImage
+from datetime               import datetime
+from PIL                    import Image, ImageTk
+
+# ─── Alarm audio (pygame) ────────────────────────────────────────
+try:
+    import pygame
+    pygame.mixer.init()
+    _PYGAME_OK = True
+except Exception:
+    _PYGAME_OK = False
+
+ALARM_PATH = "alarm.mp3"   # place alarm.mp3 in the same folder as gui.py
+
+# ─── Twilio SMS ───────────────────────────────────────────────────
+try:
+    from twilio.rest import Client as TwilioClient
+    _TWILIO_OK = True
+except ImportError:
+    _TWILIO_OK = False
+
+# ─── Credentials ─────────────────────────────────────────────────
+try:
+    import credentials as _creds
+    _CREDS_OK = True
+except ImportError:
+    _CREDS_OK = False
+
+# ─── Alert notifier ──────────────────────────────────────────────
+class AlertNotifier:
+    """
+    Sends Gmail email + Twilio SMS when a confirmed alert fires.
+    Runs in a background thread so it never blocks the UI.
+    Has its own cooldown separate from the DB/snapshot cooldown.
+    """
+    NOTIFY_COOLDOWN = 60   # minimum seconds between notifications
+
+    def __init__(self):
+        self._last_notify_ts = 0
+        self._enabled        = _CREDS_OK
+
+    @property
+    def available(self):
+        return self._enabled and _CREDS_OK
+
+    def notify(self, label, confidence, camera_id, snapshot_path=""):
+        """Call from the main thread — spawns a daemon thread to do the actual sending."""
+        if not self.available:
+            return
+        if (time.time() - self._last_notify_ts) < self.NOTIFY_COOLDOWN:
+            return
+        self._last_notify_ts = time.time()
+        t = threading.Thread(
+            target=self._send,
+            args=(label, confidence, camera_id, snapshot_path),
+            daemon=True
+        )
+        t.start()
+
+    def _send(self, label, confidence, camera_id, snapshot_path):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._send_email(label, confidence, camera_id, snapshot_path, ts)
+        self._send_sms(label, confidence, camera_id, ts)
+
+    def _send_email(self, label, confidence, camera_id, snapshot_path, ts):
+        try:
+            msg = MIMEMultipart()
+            msg["Subject"] = f"[ALERT] {label} detected — Camera {camera_id}"
+            msg["From"]    = _creds.EMAIL_SENDER
+            msg["To"]      = _creds.EMAIL_RECEIVER
+
+            body = (
+                f"⚠ {label} DETECTED\n\n"
+                f"Time      : {ts}\n"
+                f"Camera    : {camera_id}\n"
+                f"Confidence: {confidence:.0%}\n\n"
+                f"This is an automated alert from your Fire & Smoke Detection system."
+            )
+            msg.attach(MIMEText(body, "plain"))
+
+            # Attach snapshot image if one was saved
+            if snapshot_path and os.path.exists(snapshot_path):
+                with open(snapshot_path, "rb") as f:
+                    img_data = f.read()
+                img_part = MIMEImage(img_data, name=os.path.basename(snapshot_path))
+                img_part.add_header("Content-Disposition", "attachment",
+                                    filename=os.path.basename(snapshot_path))
+                msg.attach(img_part)
+
+            with smtplib.SMTP("smtp.gmail.com", 587) as s:
+                s.starttls()
+                s.login(_creds.EMAIL_SENDER, _creds.EMAIL_PASSWORD)
+                s.send_message(msg)
+        except Exception as e:
+            print(f"[AlertNotifier] Email failed: {e}")
+
+    def _send_sms(self, label, confidence, camera_id, ts):
+        if not _TWILIO_OK:
+            return
+        try:
+            client = TwilioClient(_creds.TWILIO_SID, _creds.TWILIO_TOKEN)
+            client.messages.create(
+                body=(
+                    f"ALERT: {label} detected on Camera {camera_id} "
+                    f"at {ts} (confidence {confidence:.0%}). "
+                    f"Check your system immediately."
+                ),
+                from_=_creds.TWILIO_FROM,
+                to=_creds.TWILIO_TO
+            )
+        except Exception as e:
+            print(f"[AlertNotifier] SMS failed: {e}")
 
 # ─── Optional YOLO layer ─────────────────────────────────────────
 try:
@@ -24,6 +137,61 @@ try:
     yolo_model = YOLO(_YOLO_PATH) if os.path.exists(_YOLO_PATH) else None
 except ImportError:
     yolo_model = None
+
+# ─── Alarm controller ────────────────────────────────────────────
+class AlarmController:
+    """
+    Plays alarm.mp3 on loop when an alert is active.
+    Stops cleanly when the alert clears or the user silences it.
+    """
+    def __init__(self):
+        self._playing = False
+        self._muted   = False
+        self._loaded  = False
+        if _PYGAME_OK and os.path.exists(ALARM_PATH):
+            try:
+                pygame.mixer.music.load(ALARM_PATH)
+                self._loaded = True
+            except Exception:
+                pass
+
+    @property
+    def available(self):
+        return _PYGAME_OK and self._loaded
+
+    def play(self):
+        if not self.available or self._playing or self._muted:
+            return
+        try:
+            pygame.mixer.music.play(loops=-1)
+            self._playing = True
+        except Exception:
+            pass
+
+    def stop(self):
+        if not self.available or not self._playing:
+            return
+        try:
+            pygame.mixer.music.stop()
+            self._playing = False
+        except Exception:
+            pass
+
+    def mute(self):
+        self._muted = True
+        self.stop()
+
+    def unmute(self):
+        self._muted = False
+
+    @property
+    def is_playing(self):
+        return self._playing
+
+    @property
+    def is_muted(self):
+        return self._muted
+
 
 # ─── Theme ───────────────────────────────────────────────────────
 DARK_BG      = "#0f1117"
@@ -99,20 +267,22 @@ def clear_all_data():
 # ─────────────────────────────────────────────────────────────────
 class DetectionEngine:
     ALERT_COOLDOWN       = 30   # seconds between DB writes
-    REQUIRED_CONSECUTIVE = 8    # FIX 5: raised from 4 → 8 frames before alert fires
+    REQUIRED_CONSECUTIVE = 5    # fire: 5 frames (~1.5s) — faster alert, still filters noise
 
-    def __init__(self, camera_index=0):
+    def __init__(self, camera_index=0, notifier=None):
         self.camera_index    = camera_index
+        self.notifier        = notifier
         self.result_queue    = queue.Queue(maxsize=4)
         self._running        = False
         self._thread         = None
         self.bg_sub          = cv2.createBackgroundSubtractorMOG2(
-                                   history=500, varThreshold=60,  # FIX 3: raised threshold
+                                   history=500, varThreshold=60,
                                    detectShadows=False)
-        self._consecutive    = 0
-        self._last_alert_ts  = 0
-        self._fire_history   = []   # FIX 4: for flicker/variance check
-        self._warmed_up      = False
+        self._consecutive      = 0
+        self._smoke_consecutive = 0   # separate counter for smoke — stricter
+        self._last_alert_ts    = 0
+        self._fire_history     = []   # for flicker/variance check
+        self._warmed_up        = False
         os.makedirs("snapshots", exist_ok=True)
 
     def start(self):
@@ -133,9 +303,9 @@ class DetectionEngine:
             self.result_queue.put({"error": f"Cannot open camera {self.camera_index}"})
             return
 
-        # FIX 3: warm up background subtractor for 40 frames before enabling detection
-        # This prevents static colored backgrounds from triggering on startup
-        for _ in range(40):
+        # Warm up background subtractor — 20 frames is enough to learn the static scene
+        # without making the user wait too long before detection starts
+        for _ in range(20):
             ret, frame = cap.read()
             if ret:
                 self.bg_sub.apply(cv2.resize(frame, (640, 480)))
@@ -172,18 +342,16 @@ class DetectionEngine:
 
         f_mask, f_px = self._fire_mask(hsv, fg)
         s_mask, s_px = self._smoke_mask(hsv, fg)
-        f_cnts       = self._contours(f_mask, 800)   # FIX 2: min_area raised 500 → 800
-        s_cnts       = self._contours(s_mask, 1500)  # FIX 2: min_area raised 1000 → 1500
+        f_cnts       = self._contours(f_mask, 800)
+        s_cnts       = self._smoke_contours(s_mask)   # stricter smoke-specific filter
         yolo_dets    = self._yolo(resized)
 
-        # FIX 4: flicker/variance check — real fire fluctuates, static bg does not
+        # Flicker/variance check — real fire fluctuates, static objects do not
         self._fire_history.append(f_px)
         if len(self._fire_history) > 12:
             self._fire_history.pop(0)
         fire_variance = np.var(self._fire_history) if len(self._fire_history) > 5 else 0
 
-        # FIX 2: pixel thresholds raised (5000/8000 instead of 2000/4000)
-        # FIX 4: fire also requires variance > 500 (flickering), static red bg = ~0 variance
         fire_det  = (f_px > 5000 and bool(f_cnts) and fire_variance > 500) or \
                     any(d["class"] == "fire"  for d in yolo_dets)
         smoke_det = (s_px > 8000 and bool(s_cnts)) or \
@@ -193,29 +361,45 @@ class DetectionEngine:
         if fire_det  and conf == 0.0: conf = min(0.55 + f_px/40000, 0.85)
         if smoke_det and conf == 0.0: conf = min(0.45 + s_px/80000, 0.75)
 
-        if fire_det or smoke_det:
+        # Fire and smoke use separate consecutive counters with different thresholds:
+        # fire  → 5 consecutive frames  (~1.5s) — fast response is important
+        # smoke → 12 consecutive frames (~3.5s) — much stricter, people walk through scene
+        if fire_det:
             self._consecutive += 1
         else:
             self._consecutive = max(0, self._consecutive - 1)
-        confirmed = self._consecutive >= self.REQUIRED_CONSECUTIVE
 
-        annotated = self._annotate(resized.copy(), f_cnts, s_cnts, yolo_dets, conf, fire_det, smoke_det, confirmed)
+        if smoke_det:
+            self._smoke_consecutive += 1
+        else:
+            self._smoke_consecutive = max(0, self._smoke_consecutive - 2)  # decays faster
+
+        fire_confirmed  = self._consecutive >= 5
+        smoke_confirmed = self._smoke_consecutive >= 12
+        confirmed = fire_confirmed or smoke_confirmed
+
+        annotated = self._annotate(resized.copy(), f_cnts, s_cnts, yolo_dets, conf,
+                                   fire_det, smoke_det, fire_confirmed, smoke_confirmed)
 
         snapshot = ""
         if confirmed and (time.time() - self._last_alert_ts) > self.ALERT_COOLDOWN:
             snapshot = f"snapshots/{int(time.time())}.jpg"
             cv2.imwrite(snapshot, annotated)
-            log_event(str(self.camera_index),
-                      "FIRE" if fire_det else "SMOKE", conf, snapshot)
-            self._last_alert_ts = time.time()
-            self._consecutive   = 0
+            label = "FIRE" if fire_det else "SMOKE"
+            log_event(str(self.camera_index), label, conf, snapshot)
+            if self.notifier:
+                self.notifier.notify(label, conf, str(self.camera_index), snapshot)
+            self._last_alert_ts     = time.time()
+            self._consecutive       = 0
+            self._smoke_consecutive = 0
 
         return dict(frame=annotated, fire=fire_det, smoke=smoke_det,
                     confirmed=confirmed, confidence=conf,
                     fire_pixels=f_px, smoke_pixels=s_px, snapshot=snapshot)
 
     # ─── annotation ──────────────────────────────────────────────
-    def _annotate(self, img, f_cnts, s_cnts, yolo_dets, conf, fire, smoke, confirmed):
+    def _annotate(self, img, f_cnts, s_cnts, yolo_dets, conf,
+                  fire, smoke, fire_confirmed, smoke_confirmed):
         for x,y,w,h,_ in f_cnts:
             cv2.rectangle(img,(x,y),(x+w,y+h),(0,50,255),2)
             cv2.putText(img,f"FIRE {conf:.0%}",(x,max(y-6,12)),
@@ -231,12 +415,12 @@ class DetectionEngine:
 
         # top status bar
         cv2.rectangle(img,(0,0),(640,30),(0,0,0),-1)
-        if confirmed:
-            label  = "!!! FIRE DETECTED !!!" if fire else "!!! SMOKE DETECTED !!!"
-            colour = (0,50,255)
+        if fire_confirmed:
+            label, colour = "!!! FIRE DETECTED !!!", (0, 50, 255)
+        elif smoke_confirmed:
+            label, colour = "!!! SMOKE DETECTED !!!", (180, 180, 180)
         else:
-            label  = "CLEAR"
-            colour = (60,200,110)
+            label, colour = "CLEAR", (60, 200, 110)
         cv2.putText(img, label,(8,21),cv2.FONT_HERSHEY_SIMPLEX,.65,colour,2)
         cv2.putText(img, datetime.now().strftime("%H:%M:%S"),
                     (560,21),cv2.FONT_HERSHEY_SIMPLEX,.48,(100,100,100),1)
@@ -259,11 +443,44 @@ class DetectionEngine:
         return c, moving
 
     def _smoke_mask(self, hsv, fg):
-        # FIX 1: S cap lowered 60->40 (real smoke is very desaturated)
-        # V capped at 220 (not 255) to exclude pure white walls/backgrounds
-        m = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([180, 40, 220]))
+        # Tightened further: S cap 40→30, V floor raised 160→170
+        # This better excludes light clothing (low-S but not near-zero)
+        m = cv2.inRange(hsv, np.array([0, 0, 170]), np.array([180, 30, 215]))
         c = cv2.bitwise_and(m, fg)
         return c, cv2.countNonZero(c)
+
+    def _smoke_contours(self, mask):
+        """
+        Stricter contour filter for smoke only.
+        Rejects person-shaped blobs: smoke spreads wide and low (aspect ratio > 1.2),
+        whereas a person walking is tall and narrow (aspect ratio < 0.8).
+        Also requires a larger minimum area than fire — smoke must fill significant space.
+        """
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid = []
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < 3000:   # larger minimum — ignore small blobs entirely
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            ar  = w / float(h)
+            ha  = cv2.contourArea(cv2.convexHull(c))
+            sol = area / ha if ha > 0 else 0
+
+            # Reject tall narrow shapes — these are people, not smoke
+            # Smoke: ar > 1.0 (wider than tall) OR very large area (filling the room)
+            # Person: ar < 0.8 (taller than wide) — skip these
+            if ar < 0.8:
+                continue
+
+            # Smoke is also diffuse — low solidity means irregular/wispy edges
+            # A person's outline is much more solid
+            if sol > 0.85:
+                continue
+
+            if 0.2 < ar < 6.0:
+                valid.append((x, y, w, h, area))
+        return valid
 
     def _contours(self, mask, min_area):
         cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -308,8 +525,10 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._engine:  DetectionEngine | None = None
-        self._running  = False
+        self._running    = False
         self._canvas_img = None
+        self._alarm      = AlarmController()
+        self._notifier   = AlertNotifier()
 
         self._build_ui()
         self._scan_cameras()
@@ -332,6 +551,15 @@ class App(tk.Tk):
                                bg=CARD_BG, fg=TEXT_MUTED,
                                font=FONT_BOLD, padx=8, pady=3)
         self._badge.pack(side=tk.LEFT, padx=18, pady=12)
+
+        # Mute/unmute alarm button
+        self._mute_btn = tk.Button(
+            bar, text="🔔  Alarm ON",
+            bg=CARD_BG, fg=ACCENT_GREEN, font=FONT_LABEL,
+            relief="flat", cursor="hand2", padx=8, pady=3,
+            command=self._toggle_mute
+        )
+        self._mute_btn.pack(side=tk.LEFT, pady=12)
 
         yolo_lbl = "OpenCV + YOLO" if yolo_model else "OpenCV (color mode)"
         tk.Label(bar, text=f"v1.0  |  {yolo_lbl}",
@@ -481,7 +709,7 @@ class App(tk.Tk):
     # ─────────────────── CONTROLS ────────────────────────────────
     def _start(self):
         idx = int(self._cam_var.get().split(" ")[0])
-        self._engine  = DetectionEngine(camera_index=idx)
+        self._engine  = DetectionEngine(camera_index=idx, notifier=self._notifier)
         self._engine.start()
         self._running = True
         self._btn_start.config(state=tk.DISABLED)
@@ -493,6 +721,7 @@ class App(tk.Tk):
         if self._engine:
             self._engine.stop()
             self._engine = None
+        self._alarm.stop()
         self._running = False
         self._btn_start.config(state=tk.NORMAL)
         self._btn_stop.config(state=tk.DISABLED, bg=CARD_BG, fg=TEXT_MUTED)
@@ -500,6 +729,14 @@ class App(tk.Tk):
         self._badge.config(text="  IDLE  ", fg=TEXT_MUTED)
         self._placeholder()
         self._refresh_log()
+
+    def _toggle_mute(self):
+        if self._alarm.is_muted:
+            self._alarm.unmute()
+            self._mute_btn.config(text="🔔  Alarm ON",  fg=ACCENT_GREEN)
+        else:
+            self._alarm.mute()
+            self._mute_btn.config(text="🔕  Alarm OFF", fg=TEXT_MUTED)
 
     # ─────────────────── POLLING ─────────────────────────────────
     def _poll(self):
@@ -527,17 +764,19 @@ class App(tk.Tk):
         self._canvas.create_image(cw//2, ch//2, anchor="center", image=photo)
         self._canvas_img = photo
 
-        # alert overlay on canvas
+        # alert overlay on canvas + alarm
         if d["confirmed"]:
             lbl = "🔥  FIRE DETECTED" if d["fire"] else "💨  SMOKE DETECTED"
             self._canvas.create_rectangle(0, 0, cw, 46, fill="#200000", outline="")
             self._canvas.create_text(cw//2, 23, text=lbl,
                                       fill=ACCENT_RED, font=("Segoe UI",13,"bold"))
             self._badge.config(text="  ⚠ ALERT  ", fg=ACCENT_RED)
+            self._alarm.play()   # starts looping — ignored if already playing or muted
             if d.get("snapshot"):
                 self._refresh_log()
         else:
             self._badge.config(text="  RUNNING  ", fg=ACCENT_GREEN)
+            self._alarm.stop()   # stops as soon as scene is clear
 
         # stats
         self._s_fire.config( text=f"{d['fire_pixels']:,}")
@@ -574,6 +813,7 @@ class App(tk.Tk):
     # ─────────────────── CLOSE ───────────────────────────────────
     def _on_close(self):
         if self._engine: self._engine.stop()
+        self._alarm.stop()
         self.destroy()
 
 
